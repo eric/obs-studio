@@ -58,6 +58,11 @@ struct ffmpeg_source {
 	bool close_when_inactive;
 	bool seekable;
 
+	pthread_t reconnect_thread;
+	bool stop_reconnect;
+	bool reconnect_thread_valid;
+	int reconnect_delay_time;
+
 	enum obs_media_state state;
 	obs_hotkey_pair_id play_pause_hotkey;
 	obs_hotkey_id stop_hotkey;
@@ -85,6 +90,8 @@ static bool is_local_file_modified(obs_properties_t *props,
 		obs_properties_get(props, "close_when_inactive");
 	obs_property_t *seekable = obs_properties_get(props, "seekable");
 	obs_property_t *speed = obs_properties_get(props, "speed_percent");
+	obs_property_t *reconnect_delay_time =
+		obs_properties_get(props, "reconnect_delay_time");
 	obs_property_set_visible(input, !enabled);
 	obs_property_set_visible(input_format, !enabled);
 	obs_property_set_visible(buffering, !enabled);
@@ -93,7 +100,7 @@ static bool is_local_file_modified(obs_properties_t *props,
 	obs_property_set_visible(looping, enabled);
 	obs_property_set_visible(speed, enabled);
 	obs_property_set_visible(seekable, !enabled);
-
+	obs_property_set_visible(reconnect_delay_time, !enabled);
 	return true;
 }
 
@@ -173,6 +180,11 @@ static obs_properties_t *ffmpeg_source_getproperties(void *data)
 	obs_properties_add_text(props, "input_format",
 				obs_module_text("InputFormat"),
 				OBS_TEXT_DEFAULT);
+
+	prop = obs_properties_add_int_slider(
+		props, "reconnect_delay_time",
+		obs_module_text("ReconnectDelayTime"), 1, 60, 1);
+	obs_property_int_set_suffix(prop, " S");
 
 #ifndef __APPLE__
 	obs_properties_add_bool(props, "hw_decode",
@@ -288,6 +300,44 @@ static void ffmpeg_source_open(struct ffmpeg_source *s)
 	}
 }
 
+static void ffmpeg_source_start(struct ffmpeg_source *s)
+{
+	if (!s->media_valid)
+		ffmpeg_source_open(s);
+
+	if (!s->media_valid)
+		return;
+
+	mp_media_play(&s->media, s->is_looping);
+	if (s->is_local_file)
+		obs_source_show_preloaded_video(s->source);
+	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
+	obs_source_media_started(s->source);
+}
+
+static void *ffmpeg_source_reconnect(void *data)
+{
+	struct ffmpeg_source *s = data;
+	os_sleep_ms(s->reconnect_delay_time * 1000);
+	FF_BLOG(LOG_INFO, "start reconnect thread");
+	do {
+		if (s->stop_reconnect)
+			break;
+
+		if (s->media_valid)
+			break;
+
+		bool active = obs_source_active(s->source);
+		if (!s->close_when_inactive || active)
+			ffmpeg_source_open(s);
+
+		if (!s->restart_on_activate || active)
+			ffmpeg_source_start(s);
+	} while (false);
+	s->reconnect_thread_valid = false;
+	return NULL;
+}
+
 static void ffmpeg_source_tick(void *data, float seconds)
 {
 	UNUSED_PARAMETER(seconds);
@@ -298,21 +348,19 @@ static void ffmpeg_source_tick(void *data, float seconds)
 			mp_media_free(&s->media);
 			s->media_valid = false;
 		}
+
 		s->destroy_media = false;
-	}
-}
 
-static void ffmpeg_source_start(struct ffmpeg_source *s)
-{
-	if (!s->media_valid)
-		ffmpeg_source_open(s);
-
-	if (s->media_valid) {
-		mp_media_play(&s->media, s->is_looping);
-		if (s->is_local_file)
-			obs_source_show_preloaded_video(s->source);
-		set_media_state(s, OBS_MEDIA_STATE_PLAYING);
-		obs_source_media_started(s->source);
+		if (!s->is_local_file) {
+			FF_BLOG(LOG_ERROR, "thread has been destroyed");
+			if (pthread_create(&s->reconnect_thread, NULL,
+					   ffmpeg_source_reconnect, s) != 0) {
+				FF_BLOG(LOG_WARNING,
+					"Could not create reconnect thread");
+				return;
+			}
+			s->reconnect_thread_valid = true;
+		}
 	}
 }
 
@@ -338,8 +386,19 @@ static void ffmpeg_source_update(void *data, obs_data_t *settings)
 		input = (char *)obs_data_get_string(settings, "input");
 		input_format =
 			(char *)obs_data_get_string(settings, "input_format");
+		s->reconnect_delay_time =
+			obs_data_get_int(settings, "reconnect_delay_time");
+		s->reconnect_delay_time = s->reconnect_delay_time == 0
+						  ? 10
+						  : s->reconnect_delay_time;
 		s->is_looping = false;
 		s->close_when_inactive = true;
+
+		if (s->reconnect_thread_valid) {
+			s->stop_reconnect = true;
+			pthread_join(s->reconnect_thread, NULL);
+			s->stop_reconnect = false;
+		}
 	}
 
 	s->input = input ? bstrdup(input) : NULL;
@@ -539,6 +598,11 @@ static void ffmpeg_source_destroy(void *data)
 
 	if (s->hotkey)
 		obs_hotkey_unregister(s->hotkey);
+	if (!s->is_local_file) {
+		s->stop_reconnect = true;
+		if (s->reconnect_thread_valid)
+			pthread_join(s->reconnect_thread, NULL);
+	}
 	if (s->media_valid)
 		mp_media_free(&s->media);
 
