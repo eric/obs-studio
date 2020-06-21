@@ -101,6 +101,7 @@ static bool is_local_file_modified(obs_properties_t *props,
 	obs_property_set_visible(speed, enabled);
 	obs_property_set_visible(seekable, !enabled);
 	obs_property_set_visible(reconnect_delay_time, !enabled);
+	
 	return true;
 }
 
@@ -311,6 +312,7 @@ static void ffmpeg_source_start(struct ffmpeg_source *s)
 	mp_media_play(&s->media, s->is_looping);
 	if (s->is_local_file)
 		obs_source_show_preloaded_video(s->source);
+		
 	set_media_state(s, OBS_MEDIA_STATE_PLAYING);
 	obs_source_media_started(s->source);
 }
@@ -352,7 +354,8 @@ static void ffmpeg_source_tick(void *data, float seconds)
 		s->destroy_media = false;
 
 		if (!s->is_local_file) {
-			FF_BLOG(LOG_ERROR, "thread has been destroyed");
+			FF_BLOG(LOG_ERROR,
+				"reconnect thread has been destroyed");
 			if (pthread_create(&s->reconnect_thread, NULL,
 					   ffmpeg_source_reconnect, s) != 0) {
 				FF_BLOG(LOG_WARNING,
